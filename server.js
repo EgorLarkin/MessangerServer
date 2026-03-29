@@ -3,16 +3,28 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const http = require('http');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization'] }));
-app.use(bodyParser.json({ limit: '10mb' }));
+// CORS
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
+app.options('*', cors());
 
+// Body parser с увеличенными лимитами
+app.use(bodyParser.json({ limit: '100mb', strict: false }));
+app.use(bodyParser.urlencoded({ limit: '100mb', extended: true }));
+
+// Таймауты
 app.use((req, res, next) => {
+    res.setTimeout(300000);
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
@@ -28,32 +40,70 @@ const conversationsDB = {};
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getChatKey(user1, user2) {
-    return [user1, user2].sort().join('_');
+    const sorted = [user1, user2].sort();
+    return sorted.join('_');
 }
 
 function generateUserId() {
     return 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
 
-function updateConversation(username, chatWith, lastMessage, timestamp) {
+function generateMessageId() {
+    return 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+}
+
+function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text') {
     if (!conversationsDB[username]) conversationsDB[username] = [];
     const existing = conversationsDB[username].find(c => c.chatWith === chatWith);
+    
+    let preview = lastMessage;
+    if (messageType !== 'text') {
+        const labels = {
+            'image': '📷 Фото',
+            'video': '🎬 Видео',
+            'file': '📎 Файл',
+            'voice': '🎤 Голосовое',
+            'video_note': '⭕ Кружочек'
+        };
+        preview = labels[messageType] || 'Медиа';
+    }
+    
     if (existing) {
-        existing.lastMessage = lastMessage;
+        existing.lastMessage = preview;
         existing.timestamp = timestamp;
+        existing.lastMessageType = messageType;
     } else {
-        conversationsDB[username].push({ chatWith, lastMessage, timestamp, unreadCount: 0 });
+        conversationsDB[username].push({
+            chatWith,
+            lastMessage: preview,
+            timestamp,
+            unreadCount: 0,
+            lastMessageType: messageType
+        });
     }
     conversationsDB[username].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
-async function sendPushNotification(toUsername, messageText, fromUsername) {
+async function sendPushNotification(toUsername, messageText, fromUsername, messageType = 'text') {
     const tokens = deviceTokensDB[toUsername];
-    if (!tokens || tokens.length === 0) {
-        console.log(`🔔 [NOTIFICATION] Нет токенов для ${toUsername}`);
-        return;
+    if (!tokens || tokens.length === 0) return;
+    
+    let title = 'Новое сообщение';
+    let body = messageText;
+    
+    if (messageType !== 'text') {
+        const labels = {
+            'image': '📷 Новое фото',
+            'video': '🎬 Новое видео',
+            'file': '📎 Новый файл',
+            'voice': '🎤 Голосовое сообщение',
+            'video_note': '⭕ Видеосообщение'
+        };
+        title = labels[messageType] || 'Новое медиа';
+        body = fromUsername + ' отправил(а) медиа';
     }
-    console.log(`🔔 [NOTIFICATION] 📱 ${toUsername}: ${fromUsername} отправил "${messageText}"`);
+    
+    console.log(`🔔 ${toUsername}: ${title} - ${body}`);
 }
 
 function getUserData(username) {
@@ -81,10 +131,9 @@ app.post('/auth/register', async (req, res) => {
         usersDB[username] = { id: userId, username, name, passwordHash, avatar: null, createdAt: new Date().toISOString() };
         const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
         tokensDB[token] = username;
-        console.log(`✅ [REGISTER] ${username} (${userId})`);
         res.status(201).json({ success: true, token, user: getUserData(username) });
     } catch (error) {
-        console.error('❌ [REGISTER ERROR]', error);
+        console.error('Register error:', error);
         res.status(500).json({ error: 'Ошибка сервера' });
     }
 });
@@ -100,10 +149,9 @@ app.post('/auth/login', async (req, res) => {
         if (!isValid) return res.status(401).json({ error: 'Неверный логин или пароль' });
         const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
         tokensDB[token] = username;
-        console.log(`✅ [LOGIN] ${username}`);
         res.json({ success: true, token, user: getUserData(username) });
     } catch (error) {
-        console.error('❌ [LOGIN ERROR]', error);
+        console.error('Login error:', error);
         res.status(500).json({ error: 'Ошибка сервера' });
     }
 });
@@ -112,7 +160,6 @@ app.get('/auth/verify', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ valid: false });
     const username = tokensDB[token];
-    const user = usersDB[username];
     res.json({ valid: true, user: getUserData(username) });
 });
 
@@ -145,7 +192,6 @@ app.put('/profile', (req, res) => {
     const { name } = req.body;
     if (!usersDB[username]) return res.status(404).json({ error: 'Пользователь не найден' });
     if (name && name.length >= 2) usersDB[username].name = name;
-    console.log(`✏️ [PROFILE UPDATE] ${username}: name = ${name}`);
     res.json({ success: true, user: getUserData(username) });
 });
 
@@ -156,8 +202,17 @@ app.put('/profile/avatar', (req, res) => {
     const { avatar } = req.body;
     if (!usersDB[username]) return res.status(404).json({ error: 'Пользователь не найден' });
     usersDB[username].avatar = avatar;
-    console.log(`🖼️ [AVATAR] ${username} обновил аватар`);
     res.json({ success: true, user: getUserData(username) });
+});
+
+app.delete('/profile', (req, res) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
+    const username = tokensDB[token];
+    delete usersDB[username];
+    delete tokensDB[token];
+    delete conversationsDB[username];
+    res.json({ success: true });
 });
 
 // === УВЕДОМЛЕНИЯ ===
@@ -169,7 +224,6 @@ app.post('/notifications/register-token', (req, res) => {
     if (!deviceToken) return res.status(400).json({ error: 'deviceToken обязателен' });
     if (!deviceTokensDB[username]) deviceTokensDB[username] = [];
     if (!deviceTokensDB[username].includes(deviceToken)) deviceTokensDB[username].push(deviceToken);
-    console.log(`🔔 [NOTIFICATION] Токен сохранён для ${username}`);
     res.json({ success: true });
 });
 
@@ -179,32 +233,86 @@ app.get('/conversations', (req, res) => {
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
     const username = tokensDB[token];
     const conversations = conversationsDB[username] || [];
-    const enriched = conversations.map(conv => ({
-        ...conv,
-        user: usersDB[conv.chatWith] ? { id: usersDB[conv.chatWith].id, username: usersDB[conv.chatWith].username, name: usersDB[conv.chatWith].name, avatar: usersDB[conv.chatWith].avatar || null } : null
-    })).filter(c => c.user !== null);
+    
+    const enriched = conversations.map(conv => {
+        const user = usersDB[conv.chatWith];
+        if (!user) return null;
+        return {
+            chatWith: conv.chatWith,
+            lastMessage: conv.lastMessage,
+            timestamp: conv.timestamp,
+            unreadCount: conv.unreadCount || 0,
+            lastMessageType: conv.lastMessageType || 'text',
+            user: {
+                id: user.id,
+                username: user.username,
+                name: user.name,
+                avatar: user.avatar || null
+            }
+        };
+    }).filter(c => c !== null);
+    
     res.json({ success: true, conversations: enriched });
 });
 
 // === СООБЩЕНИЯ ===
 app.post('/send', (req, res) => {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
-    const username = tokensDB[token];
-    const { to, text } = req.body;
-    if (!to || !text) return res.status(400).json({ error: 'Заполните все поля' });
+    const authToken = req.headers.authorization?.replace('Bearer ', '');
+    if (!authToken || !tokensDB[authToken]) return res.status(401).json({ error: 'Неавторизован' });
+    const username = tokensDB[authToken];
+    const { to, text, mediaType, mediaData, duration, fileName, fileSize } = req.body;
+    
+    if (!to) return res.status(400).json({ error: 'Заполните все поля' });
     if (!usersDB[to]) return res.status(404).json({ error: 'Пользователь не найден' });
 
-    const message = { id: Date.now().toString(), from: username, to, text, timestamp: new Date().toISOString() };
+    let messageType = 'text';
+    if (mediaType && mediaType !== 'text') {
+        messageType = mediaType;
+    } else if (mediaData && mediaData.startsWith('image')) {
+        messageType = 'image';
+    } else if (mediaData && mediaData.startsWith('video')) {
+        messageType = 'video';
+    } else if (mediaData && mediaData.startsWith('audio')) {
+        messageType = 'voice';
+    }
+    
+    if (messageType === 'text' && (!text || text.trim() === '')) {
+        return res.status(400).json({ error: 'Заполните все поля' });
+    }
+
+    const message = {
+        id: generateMessageId(),
+        from: username,
+        to,
+        text: text || '',
+        mediaType: messageType,
+        mediaData: mediaData || null,
+        duration: duration || null,
+        fileName: fileName || null,
+        fileSize: fileSize || null,
+        timestamp: new Date().toISOString()
+    };
+
     const chatKey = getChatKey(username, to);
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
-    console.log(`💬 [MESSAGE] ${username} → ${to}: ${text}`);
 
-    updateConversation(username, to, text, message.timestamp);
-    updateConversation(to, username, text, message.timestamp);
+    let preview = text || '';
+    if (messageType !== 'text') {
+        const labels = {
+            'image': '📷 Фото',
+            'video': '🎬 Видео',
+            'file': '📎 Файл',
+            'voice': '🎤 Голосовое',
+            'video_note': '⭕ Кружочек'
+        };
+        preview = labels[messageType] || 'Медиа';
+    }
+    
+    updateConversation(username, to, preview, message.timestamp, messageType);
+    updateConversation(to, username, preview, message.timestamp, messageType);
+    sendPushNotification(to, text || preview, username, messageType);
 
-    sendPushNotification(to, text, username);
     res.status(201).json({ success: true, message });
 });
 
@@ -222,7 +330,10 @@ app.get('/history/:user1/:user2', (req, res) => {
 });
 
 // === ЗАПУСК ===
-app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 Сервер запущен на порту ' + PORT);
-    console.log('🌐 URL: http://localhost:' + PORT);
+const server = http.createServer(app);
+server.timeout = 300000;
+
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌐 URL: https://messangerserver-1.onrender.com`);
 });
