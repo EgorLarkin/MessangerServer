@@ -18,11 +18,11 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// Body parser с увеличенными лимитами
+// Body parser с увеличенными лимитами для фото/видео
 app.use(bodyParser.json({ limit: '100mb', strict: false }));
 app.use(bodyParser.urlencoded({ limit: '100mb', extended: true }));
 
-// Таймауты
+// Таймауты для больших файлов
 app.use((req, res, next) => {
     res.setTimeout(300000);
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
