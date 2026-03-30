@@ -4,14 +4,13 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const http = require('http');
-const WebSocket = require('ws');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// === CORS ===
+// CORS
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -19,11 +18,11 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// === Body parser с увеличенными лимитами ===
+// Body parser с увеличенными лимитами для фото/видео
 app.use(bodyParser.json({ limit: '100mb', strict: false }));
 app.use(bodyParser.urlencoded({ limit: '100mb', extended: true }));
 
-// === Таймауты и заголовки ===
+// Таймауты для больших файлов
 app.use((req, res, next) => {
     res.setTimeout(300000);
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
@@ -32,17 +31,12 @@ app.use((req, res, next) => {
     next();
 });
 
-// === БАЗА ДАННЫХ (в памяти) ===
+// === БАЗА ДАННЫХ ===
 const usersDB = {};
 const messagesDB = {};
 const tokensDB = {};
 const deviceTokensDB = {};
 const conversationsDB = {};
-
-// === WebSocket сервер ===
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-const activeConnections = {}; // username -> Set<WebSocket>
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getChatKey(user1, user2) {
@@ -110,7 +104,6 @@ async function sendPushNotification(toUsername, messageText, fromUsername, messa
     }
     
     console.log(`🔔 ${toUsername}: ${title} - ${body}`);
-    // Здесь можно добавить интеграцию с APNs/FCM
 }
 
 function getUserData(username) {
@@ -124,155 +117,7 @@ function getUserData(username) {
     };
 }
 
-// === WEBSOCKET ОБРАБОТЧИК ===
-wss.on('connection', (ws, req) => {
-    let authenticatedUser = null;
-    
-    console.log('🔌 Новое WebSocket-подключение');
-    
-    ws.on('message', async (message) => {
-        try {
-            const data = JSON.parse(message);
-            
-            // 🔐 Аутентификация
-            if (data.type === 'auth') {
-                const token = data.token?.replace('Bearer ', '');
-                if (!token || !tokensDB[token]) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Неавторизован' }));
-                    ws.close();
-                    return;
-                }
-                const username = tokensDB[token];
-                authenticatedUser = username;
-                
-                if (!activeConnections[username]) {
-                    activeConnections[username] = new Set();
-                }
-                activeConnections[username].add(ws);
-                
-                ws.send(JSON.stringify({ 
-                    type: 'auth_success', 
-                    username,
-                    message: 'Подключено к чату' 
-                }));
-                console.log(`✅ ${username} подключен к WebSocket`);
-                return;
-            }
-            
-            // 📨 Новое сообщение
-            if (data.type === 'new_message' && authenticatedUser) {
-                const { to, text, mediaType, mediaData, duration, fileName, fileSize } = data.payload;
-                
-                if (!to || !usersDB[to]) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Пользователь не найден' }));
-                    return;
-                }
-                
-                const messageType = mediaType || (mediaData?.startsWith('image') ? 'image' : 
-                                   mediaData?.startsWith('video') ? 'video' : 
-                                   mediaData?.startsWith('audio') ? 'voice' : 'text');
-                
-                const messageObj = {
-                    id: generateMessageId(),
-                    from: authenticatedUser,
-                    to,
-                    text: text || '',
-                    mediaType: messageType,
-                    mediaData: mediaData || null,
-                    duration: duration || null,
-                    fileName: fileName || null,
-                    fileSize: fileSize || null,
-                    timestamp: new Date().toISOString()
-                };
-                
-                // Сохраняем в БД
-                const chatKey = getChatKey(authenticatedUser, to);
-                if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
-                messagesDB[chatKey].push(messageObj);
-                
-                // Обновляем списки чатов
-                const preview = messageType === 'text' ? text : {
-                    'image': '📷 Фото',
-                    'video': '🎬 Видео',
-                    'file': '📎 Файл',
-                    'voice': '🎤 Голосовое',
-                    'video_note': '⭕ Кружочек'
-                }[messageType] || 'Медиа';
-                
-                updateConversation(authenticatedUser, to, preview, messageObj.timestamp, messageType);
-                updateConversation(to, authenticatedUser, preview, messageObj.timestamp, messageType);
-                
-                // 🎯 Отправляем получателю в реальном времени
-                if (activeConnections[to]) {
-                    activeConnections[to].forEach(client => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
-                                type: 'message_received',
-                                payload: messageObj
-                            }));
-                        }
-                    });
-                }
-                
-                // 🔔 Push если офлайн
-                sendPushNotification(to, text || preview, authenticatedUser, messageType);
-                
-                // ✅ Подтверждение отправителю
-                ws.send(JSON.stringify({
-                    type: 'message_sent',
-                    payload: messageObj
-                }));
-            }
-            
-            // ✍️ Индикатор "печатает..."
-            if (data.type === 'typing' && authenticatedUser) {
-                const { to } = data.payload;
-                if (activeConnections[to]) {
-                    activeConnections[to].forEach(client => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
-                                type: 'user_typing',
-                                payload: { from: authenticatedUser }
-                            }));
-                        }
-                    });
-                }
-            }
-            
-            // 👋 Отключение
-            if (data.type === 'disconnect' && authenticatedUser) {
-                if (activeConnections[authenticatedUser]) {
-                    activeConnections[authenticatedUser].delete(ws);
-                    if (activeConnections[authenticatedUser].size === 0) {
-                        delete activeConnections[authenticatedUser];
-                    }
-                }
-                console.log(`🔌 ${authenticatedUser} отключился`);
-            }
-            
-        } catch (error) {
-            console.error('❌ WebSocket error:', error);
-            ws.send(JSON.stringify({ type: 'error', message: 'Ошибка обработки' }));
-        }
-    });
-    
-    ws.on('close', () => {
-        if (authenticatedUser && activeConnections[authenticatedUser]) {
-            activeConnections[authenticatedUser].delete(ws);
-            if (activeConnections[authenticatedUser].size === 0) {
-                delete activeConnections[authenticatedUser];
-            }
-        }
-    });
-    
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
-    });
-});
-
-// === REST API ===
-
-// 🔐 Регистрация
+// === АУТЕНТИФИКАЦИЯ ===
 app.post('/auth/register', async (req, res) => {
     const { username, password, name } = req.body;
     if (!username || !password || !name) return res.status(400).json({ error: 'Заполните все поля' });
@@ -293,7 +138,6 @@ app.post('/auth/register', async (req, res) => {
     }
 });
 
-// 🔐 Вход
 app.post('/auth/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Заполните все поля' });
@@ -312,7 +156,6 @@ app.post('/auth/login', async (req, res) => {
     }
 });
 
-// 🔐 Проверка токена
 app.get('/auth/verify', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ valid: false });
@@ -320,36 +163,28 @@ app.get('/auth/verify', (req, res) => {
     res.json({ valid: true, user: getUserData(username) });
 });
 
-// 👥 Список пользователей
+// === ПОЛЬЗОВАТЕЛИ ===
 app.get('/users', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
-    const userList = Object.values(usersDB).map(u => ({ 
-        id: u.id, 
-        username: u.username, 
-        name: u.name, 
-        avatar: u.avatar || null 
-    }));
+    const userList = Object.values(usersDB).map(u => ({ id: u.id, username: u.username, name: u.name, avatar: u.avatar || null }));
     res.json({ users: userList });
 });
 
-// 🔍 Поиск пользователей
 app.get('/users/search', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
     const query = (req.query.q || '').toLowerCase();
     const currentUsername = tokensDB[token];
     if (!query) return res.json({ users: [] });
-    
     const filteredUsers = Object.values(usersDB)
         .filter(u => u.username !== currentUsername)
         .filter(u => u.username.toLowerCase().includes(query) || u.name.toLowerCase().includes(query))
         .map(u => ({ id: u.id, username: u.username, name: u.name, avatar: u.avatar || null }));
-    
     res.json({ users: filteredUsers });
 });
 
-// 👤 Профиль — обновление
+// === ПРОФИЛЬ ===
 app.put('/profile', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
@@ -360,7 +195,6 @@ app.put('/profile', (req, res) => {
     res.json({ success: true, user: getUserData(username) });
 });
 
-// 🖼️ Аватар
 app.put('/profile/avatar', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
@@ -371,7 +205,6 @@ app.put('/profile/avatar', (req, res) => {
     res.json({ success: true, user: getUserData(username) });
 });
 
-// 🗑️ Удаление аккаунта
 app.delete('/profile', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
@@ -382,7 +215,7 @@ app.delete('/profile', (req, res) => {
     res.json({ success: true });
 });
 
-// 🔔 Push-токен
+// === УВЕДОМЛЕНИЯ ===
 app.post('/notifications/register-token', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
@@ -394,7 +227,7 @@ app.post('/notifications/register-token', (req, res) => {
     res.json({ success: true });
 });
 
-// 💬 Список чатов
+// === ЧАТЫ ===
 app.get('/conversations', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
@@ -422,7 +255,7 @@ app.get('/conversations', (req, res) => {
     res.json({ success: true, conversations: enriched });
 });
 
-// 📤 Отправка сообщения (через REST — дублирует WebSocket)
+// === СООБЩЕНИЯ ===
 app.post('/send', (req, res) => {
     const authToken = req.headers.authorization?.replace('Bearer ', '');
     if (!authToken || !tokensDB[authToken]) return res.status(401).json({ error: 'Неавторизован' });
@@ -464,34 +297,25 @@ app.post('/send', (req, res) => {
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
 
-    const preview = messageType === 'text' ? text : {
-        'image': '📷 Фото',
-        'video': '🎬 Видео',
-        'file': '📎 Файл',
-        'voice': '🎤 Голосовое',
-        'video_note': '⭕ Кружочек'
-    }[messageType] || 'Медиа';
+    let preview = text || '';
+    if (messageType !== 'text') {
+        const labels = {
+            'image': '📷 Фото',
+            'video': '🎬 Видео',
+            'file': '📎 Файл',
+            'voice': '🎤 Голосовое',
+            'video_note': '⭕ Кружочек'
+        };
+        preview = labels[messageType] || 'Медиа';
+    }
     
     updateConversation(username, to, preview, message.timestamp, messageType);
     updateConversation(to, username, preview, message.timestamp, messageType);
     sendPushNotification(to, text || preview, username, messageType);
 
-    // 🔄 Если получатель онлайн — отправляем через WebSocket
-    if (activeConnections[to]) {
-        activeConnections[to].forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({
-                    type: 'message_received',
-                    payload: message
-                }));
-            }
-        });
-    }
-
     res.status(201).json({ success: true, message });
 });
 
-// 📚 История сообщений
 app.get('/history/:user1/:user2', (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
@@ -506,10 +330,10 @@ app.get('/history/:user1/:user2', (req, res) => {
 });
 
 // === ЗАПУСК ===
+const server = http.createServer(app);
 server.timeout = 300000;
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`🌐 URL: https://messangerserver-1.onrender.com`);
-    console.log(`🔌 WebSocket ready`);
 });
