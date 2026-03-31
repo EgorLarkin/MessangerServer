@@ -4,6 +4,8 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const http = require('http');
+const WebSocket = require('ws');
+const { URL } = require('url');
 require('dotenv').config();
 
 const app = express();
@@ -55,7 +57,7 @@ function generateMessageId() {
 function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text') {
     if (!conversationsDB[username]) conversationsDB[username] = [];
     const existing = conversationsDB[username].find(c => c.chatWith === chatWith);
-    
+
     let preview = lastMessage;
     if (messageType !== 'text') {
         const labels = {
@@ -67,7 +69,7 @@ function updateConversation(username, chatWith, lastMessage, timestamp, messageT
         };
         preview = labels[messageType] || 'Медиа';
     }
-    
+
     if (existing) {
         existing.lastMessage = preview;
         existing.timestamp = timestamp;
@@ -81,16 +83,17 @@ function updateConversation(username, chatWith, lastMessage, timestamp, messageT
             lastMessageType: messageType
         });
     }
+
     conversationsDB[username].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
 async function sendPushNotification(toUsername, messageText, fromUsername, messageType = 'text') {
     const tokens = deviceTokensDB[toUsername];
     if (!tokens || tokens.length === 0) return;
-    
+
     let title = 'Новое сообщение';
     let body = messageText;
-    
+
     if (messageType !== 'text') {
         const labels = {
             'image': '📷 Новое фото',
@@ -102,7 +105,7 @@ async function sendPushNotification(toUsername, messageText, fromUsername, messa
         title = labels[messageType] || 'Новое медиа';
         body = fromUsername + ' отправил(а) медиа';
     }
-    
+
     console.log(`🔔 ${toUsername}: ${title} - ${body}`);
 }
 
@@ -233,7 +236,7 @@ app.get('/conversations', (req, res) => {
     if (!token || !tokensDB[token]) return res.status(401).json({ error: 'Неавторизован' });
     const username = tokensDB[token];
     const conversations = conversationsDB[username] || [];
-    
+
     const enriched = conversations.map(conv => {
         const user = usersDB[conv.chatWith];
         if (!user) return null;
@@ -251,17 +254,17 @@ app.get('/conversations', (req, res) => {
             }
         };
     }).filter(c => c !== null);
-    
+
     res.json({ success: true, conversations: enriched });
 });
 
 // === СООБЩЕНИЯ ===
-app.post('/send', (req, res) => {
+app.post('/send', async (req, res) => {
     const authToken = req.headers.authorization?.replace('Bearer ', '');
     if (!authToken || !tokensDB[authToken]) return res.status(401).json({ error: 'Неавторизован' });
     const username = tokensDB[authToken];
     const { to, text, mediaType, mediaData, duration, fileName, fileSize } = req.body;
-    
+
     if (!to) return res.status(400).json({ error: 'Заполните все поля' });
     if (!usersDB[to]) return res.status(404).json({ error: 'Пользователь не найден' });
 
@@ -275,7 +278,7 @@ app.post('/send', (req, res) => {
     } else if (mediaData && mediaData.startsWith('audio')) {
         messageType = 'voice';
     }
-    
+
     if (messageType === 'text' && (!text || text.trim() === '')) {
         return res.status(400).json({ error: 'Заполните все поля' });
     }
@@ -308,16 +311,20 @@ app.post('/send', (req, res) => {
         };
         preview = labels[messageType] || 'Медиа';
     }
-    
+
     updateConversation(username, to, preview, message.timestamp, messageType);
     updateConversation(to, username, preview, message.timestamp, messageType);
 
-    // Уведомление WebSocket-клиентов
     wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN && tokensDB[authToken] === client.user) {
+        if (
+            client.readyState === WebSocket.OPEN &&
+            (client.user === username || client.user === to)
+        ) {
             client.send(JSON.stringify(message));
         }
     });
+
+    await sendPushNotification(to, preview, username, messageType);
 
     res.status(201).json({ success: true, message });
 });
@@ -339,49 +346,49 @@ app.get('/history/:user1/:user2', (req, res) => {
 const server = http.createServer(app);
 server.timeout = 300000;
 
+const wss = new WebSocket.Server({ noServer: true });
+
+wss.on('connection', (ws, request, username) => {
+    ws.user = username;
+    console.log(`✅ WebSocket connected: ${username}`);
+
+    ws.on('message', message => {
+        console.log(`Received from ${username}: ${message}`);
+    });
+
+    ws.on('close', () => {
+        console.log(`❌ WebSocket disconnected: ${username}`);
+    });
+});
+
+server.on('upgrade', (request, socket, head) => {
+    try {
+        const url = new URL(request.url, 'http://localhost');
+
+        if (url.pathname !== '/socket') {
+            socket.destroy();
+            return;
+        }
+
+        const token = url.searchParams.get('token');
+        if (!token || !tokensDB[token]) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+
+        const username = tokensDB[token];
+
+        wss.handleUpgrade(request, socket, head, ws => {
+            wss.emit('connection', ws, request, username);
+        });
+    } catch (error) {
+        console.error('Upgrade error:', error);
+        socket.destroy();
+    }
+});
+
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`🌐 URL: https://messangerserver-1.onrender.com`);
-});
-
-const WebSocket = require('ws');
-
-// Создайте WebSocket-сервер
-const wss = new WebSocket.Server({ noServer: true });
-
-// Обработчик подключения WebSocket
-wss.on('connection', (ws, req) => {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token || !tokensDB[token]) return ws.close();
-
-    const username = tokensDB[token];
-
-    // Отправка новых сообщений пользователю
-    ws.on('message', async message => {
-        console.log(`Received: ${message}`);
-    });
-
-    // Функция для отправки сообщения клиенту
-    function sendMessage(message) {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(message));
-        }
-    }
-
-    // Отправка истории сообщений при подключении
-    const chatKey = getChatKey(username, req.params.user1);
-    const history = messagesDB[chatKey] || [];
-    history.forEach(msg => sendMessage(msg));
-
-    // Обновление WebSocket-клиента при получении новых сообщений
-    ws.on('close', () => {
-        console.log('WebSocket connection closed');
-    });
-});
-
-// Интеграция WebSocket с HTTP сервером
-server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, ws => {
-        wss.emit('connection', ws, request);
-    });
 });
