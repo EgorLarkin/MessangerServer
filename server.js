@@ -7,11 +7,20 @@ const http = require('http');
 const WebSocket = require('ws');
 const { URL } = require('url');
 const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const BASE_URL = process.env.BASE_URL || 'https://messangerserver-1.onrender.com';
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+
+if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
 
 app.use(cors({
     origin: '*',
@@ -25,16 +34,23 @@ app.use(bodyParser.urlencoded({ limit: '20mb', extended: true }));
 
 app.use((req, res, next) => {
     res.setTimeout(300000);
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.set('Pragma', 'no-cache');
-    res.set('Expires', '0');
     next();
 });
 
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, UPLOADS_DIR);
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname) || '';
+        cb(null, crypto.randomUUID() + ext);
+    }
+});
+
 const upload = multer({
-    storage: multer.memoryStorage(),
+    storage,
     limits: {
-        fileSize: 500 * 1024 * 1024
+        fileSize: 1024 * 1024 * 1024
     }
 });
 
@@ -43,17 +59,18 @@ const messagesDB = {};
 const tokensDB = {};
 const deviceTokensDB = {};
 const conversationsDB = {};
+const filesDB = {};
 
 function getChatKey(user1, user2) {
     return [user1, user2].sort().join('_');
 }
 
 function generateUserId() {
-    return 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    return 'user_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
 }
 
 function generateMessageId() {
-    return 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    return 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
 }
 
 function getUserData(username) {
@@ -67,21 +84,21 @@ function getUserData(username) {
     };
 }
 
+function mediaPreview(type, fileName, text) {
+    if (type === 'text') return text || '';
+    if (type === 'image') return '📷 Фото';
+    if (type === 'video') return '🎬 Видео';
+    if (type === 'file') return fileName || '📎 Файл';
+    if (type === 'voice') return '🎤 Голосовое';
+    if (type === 'video_note') return '⭕ Кружочек';
+    return fileName || 'Медиа';
+}
+
 function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text') {
     if (!conversationsDB[username]) conversationsDB[username] = [];
-    const existing = conversationsDB[username].find(c => c.chatWith === chatWith);
 
-    let preview = lastMessage;
-    if (messageType !== 'text') {
-        const labels = {
-            image: '📷 Фото',
-            video: '🎬 Видео',
-            file: '📎 Файл',
-            voice: '🎤 Голосовое',
-            video_note: '⭕ Кружочек'
-        };
-        preview = labels[messageType] || 'Медиа';
-    }
+    const existing = conversationsDB[username].find(c => c.chatWith === chatWith);
+    const preview = mediaPreview(messageType, lastMessage, lastMessage);
 
     if (existing) {
         existing.lastMessage = preview;
@@ -100,26 +117,21 @@ function updateConversation(username, chatWith, lastMessage, timestamp, messageT
     conversationsDB[username].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
-async function sendPushNotification(toUsername, messageText, fromUsername, messageType = 'text') {
-    const tokens = deviceTokensDB[toUsername];
-    if (!tokens || tokens.length === 0) return;
+function sanitizeMessage(message) {
+    const { mediaData, ...rest } = message;
+    return rest;
+}
 
-    let title = 'Новое сообщение';
-    let body = messageText;
-
-    if (messageType !== 'text') {
-        const labels = {
-            image: '📷 Новое фото',
-            video: '🎬 Новое видео',
-            file: '📎 Новый файл',
-            voice: '🎤 Голосовое сообщение',
-            video_note: '⭕ Видеосообщение'
-        };
-        title = labels[messageType] || 'Новое медиа';
-        body = `${fromUsername} отправил(а) вложение`;
-    }
-
-    console.log(`🔔 ${toUsername}: ${title} - ${body}`);
+function sendMessageToParticipants(message, username, to) {
+    const payload = JSON.stringify(sanitizeMessage(message));
+    wss.clients.forEach(client => {
+        if (
+            client.readyState === WebSocket.OPEN &&
+            (client.user === username || client.user === to)
+        ) {
+            client.send(payload);
+        }
+    });
 }
 
 function requireAuth(req, res, next) {
@@ -137,30 +149,25 @@ app.post('/auth/register', async (req, res) => {
     if (!username || !password || !name) return res.status(400).json({ error: 'Заполните все поля' });
     if (usersDB[username]) return res.status(409).json({ error: 'Пользователь уже существует' });
 
-    try {
-        const passwordHash = await bcrypt.hash(password, 10);
-        const userId = generateUserId();
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userId = generateUserId();
 
-        usersDB[username] = {
-            id: userId,
-            username,
-            name,
-            passwordHash,
-            avatar: null,
-            createdAt: new Date().toISOString()
-        };
+    usersDB[username] = {
+        id: userId,
+        username,
+        name,
+        passwordHash,
+        avatar: null
+    };
 
-        const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
-        tokensDB[token] = username;
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
+    tokensDB[token] = username;
 
-        res.status(201).json({
-            success: true,
-            token,
-            user: getUserData(username)
-        });
-    } catch (error) {
-        res.status(500).json({ error: 'Ошибка сервера' });
-    }
+    res.status(201).json({
+        success: true,
+        token,
+        user: getUserData(username)
+    });
 });
 
 app.post('/auth/login', async (req, res) => {
@@ -170,40 +177,25 @@ app.post('/auth/login', async (req, res) => {
     const user = usersDB[username];
     if (!user) return res.status(401).json({ error: 'Неверный логин или пароль' });
 
-    try {
-        const isValid = await bcrypt.compare(password, user.passwordHash);
-        if (!isValid) return res.status(401).json({ error: 'Неверный логин или пароль' });
+    const isValid = await bcrypt.compare(password, user.passwordHash);
+    if (!isValid) return res.status(401).json({ error: 'Неверный логин или пароль' });
 
-        const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
-        tokensDB[token] = username;
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
+    tokensDB[token] = username;
 
-        res.json({
-            success: true,
-            token,
-            user: getUserData(username)
-        });
-    } catch (error) {
-        res.status(500).json({ error: 'Ошибка сервера' });
-    }
+    res.json({
+        success: true,
+        token,
+        user: getUserData(username)
+    });
 });
 
 app.get('/auth/verify', requireAuth, (req, res) => {
     res.json({ valid: true, user: getUserData(req.username) });
 });
 
-app.get('/users', requireAuth, (req, res) => {
-    const userList = Object.values(usersDB).map(u => ({
-        id: u.id,
-        username: u.username,
-        name: u.name,
-        avatar: u.avatar || null
-    }));
-    res.json({ users: userList });
-});
-
 app.get('/users/search', requireAuth, (req, res) => {
     const query = (req.query.q || '').toLowerCase();
-    if (!query) return res.json({ users: [] });
 
     const filteredUsers = Object.values(usersDB)
         .filter(u => u.username !== req.username)
@@ -221,25 +213,10 @@ app.get('/users/search', requireAuth, (req, res) => {
     res.json({ users: filteredUsers });
 });
 
-app.put('/profile', requireAuth, (req, res) => {
-    const { name } = req.body;
-    if (!usersDB[req.username]) return res.status(404).json({ error: 'Пользователь не найден' });
-    if (name && name.length >= 2) usersDB[req.username].name = name;
-    res.json({ success: true, user: getUserData(req.username) });
-});
-
 app.put('/profile/avatar', requireAuth, (req, res) => {
     const { avatar } = req.body;
-    if (!usersDB[req.username]) return res.status(404).json({ error: 'Пользователь не найден' });
     usersDB[req.username].avatar = avatar;
     res.json({ success: true, user: getUserData(req.username) });
-});
-
-app.delete('/profile', requireAuth, (req, res) => {
-    delete usersDB[req.username];
-    delete conversationsDB[req.username];
-    delete tokensDB[req.token];
-    res.json({ success: true });
 });
 
 app.post('/notifications/register-token', requireAuth, (req, res) => {
@@ -279,28 +256,26 @@ app.get('/conversations', requireAuth, (req, res) => {
     res.json({ success: true, conversations: enriched });
 });
 
-app.post('/send', requireAuth, async (req, res) => {
+app.post('/send', requireAuth, (req, res) => {
     const username = req.username;
-    const { to, text, mediaType, mediaData, duration, fileName, fileSize } = req.body;
+    const { to, text } = req.body;
 
     if (!to) return res.status(400).json({ error: 'Получатель обязателен' });
     if (!usersDB[to]) return res.status(404).json({ error: 'Пользователь не найден' });
-
-    const messageType = mediaType || 'text';
-    if (messageType === 'text' && (!text || text.trim() === '')) {
-        return res.status(400).json({ error: 'Текст сообщения пустой' });
-    }
+    if (!text || !text.trim()) return res.status(400).json({ error: 'Текст сообщения пустой' });
 
     const message = {
         id: generateMessageId(),
         from: username,
         to,
-        text: text || '',
-        mediaType: messageType,
-        mediaData: mediaData || null,
-        duration: duration ? Number(duration) : null,
-        fileName: fileName || null,
-        fileSize: fileSize ? Number(fileSize) : null,
+        text,
+        mediaType: 'text',
+        mediaData: null,
+        fileId: null,
+        downloadUrl: null,
+        duration: null,
+        fileName: null,
+        fileSize: null,
         timestamp: new Date().toISOString()
     };
 
@@ -308,48 +283,46 @@ app.post('/send', requireAuth, async (req, res) => {
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
 
-    const preview = messageType === 'text'
-        ? message.text
-        : (fileName || messageType);
+    updateConversation(username, to, text, message.timestamp, 'text');
+    updateConversation(to, username, text, message.timestamp, 'text');
 
-    updateConversation(username, to, preview, message.timestamp, messageType);
-    updateConversation(to, username, preview, message.timestamp, messageType);
-
-    wss.clients.forEach(client => {
-        if (
-            client.readyState === WebSocket.OPEN &&
-            (client.user === username || client.user === to)
-        ) {
-            client.send(JSON.stringify(message));
-        }
-    });
-
-    await sendPushNotification(to, preview, username, messageType);
-    res.status(201).json({ success: true, message });
+    sendMessageToParticipants(message, username, to);
+    res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
-app.post('/send-media', requireAuth, upload.single('file'), async (req, res) => {
+app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
     const username = req.username;
-    const { to, text, mediaType, duration } = req.body;
+    const { to, mediaType, text, duration } = req.body;
 
     if (!to) return res.status(400).json({ error: 'Получатель обязателен' });
     if (!usersDB[to]) return res.status(404).json({ error: 'Пользователь не найден' });
     if (!req.file) return res.status(400).json({ error: 'Файл не найден' });
 
-    const file = req.file;
-    const safeMediaType = mediaType || 'file';
-    const mediaData = `${file.mimetype};base64,${file.buffer.toString('base64')}`;
+    const fileId = crypto.randomUUID();
+    filesDB[fileId] = {
+        id: fileId,
+        owner: username,
+        recipient: to,
+        originalName: req.file.originalname,
+        storedName: req.file.filename,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        path: req.file.path,
+        createdAt: new Date().toISOString()
+    };
 
     const message = {
         id: generateMessageId(),
         from: username,
         to,
         text: text || '',
-        mediaType: safeMediaType,
-        mediaData,
+        mediaType: mediaType || 'file',
+        mediaData: null,
+        fileId,
+        downloadUrl: `${BASE_URL}/files/${fileId}`,
         duration: duration ? Number(duration) : null,
-        fileName: file.originalname,
-        fileSize: file.size,
+        fileName: req.file.originalname,
+        fileSize: req.file.size,
         timestamp: new Date().toISOString()
     };
 
@@ -357,22 +330,22 @@ app.post('/send-media', requireAuth, upload.single('file'), async (req, res) => 
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
 
-    const preview = file.originalname || safeMediaType;
+    updateConversation(username, to, req.file.originalname, message.timestamp, message.mediaType);
+    updateConversation(to, username, req.file.originalname, message.timestamp, message.mediaType);
 
-    updateConversation(username, to, preview, message.timestamp, safeMediaType);
-    updateConversation(to, username, preview, message.timestamp, safeMediaType);
+    sendMessageToParticipants(message, username, to);
+    res.status(201).json({ success: true, message: sanitizeMessage(message) });
+});
 
-    wss.clients.forEach(client => {
-        if (
-            client.readyState === WebSocket.OPEN &&
-            (client.user === username || client.user === to)
-        ) {
-            client.send(JSON.stringify(message));
-        }
-    });
+app.get('/files/:fileId', requireAuth, (req, res) => {
+    const file = filesDB[req.params.fileId];
+    if (!file) return res.status(404).json({ error: 'Файл не найден' });
 
-    await sendPushNotification(to, preview, username, safeMediaType);
-    res.status(201).json({ success: true, message });
+    if (req.username !== file.owner && req.username !== file.recipient) {
+        return res.status(403).json({ error: 'Нет доступа' });
+    }
+
+    res.download(file.path, file.originalName);
 });
 
 app.get('/history/:user1/:user2', requireAuth, (req, res) => {
@@ -383,22 +356,15 @@ app.get('/history/:user1/:user2', requireAuth, (req, res) => {
     res.json({
         success: true,
         count: history.length,
-        messages: history.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+        messages: history.map(sanitizeMessage).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
     });
 });
 
 const server = http.createServer(app);
-server.timeout = 300000;
-
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws, request, username) => {
     ws.user = username;
-    console.log(`✅ WebSocket connected: ${username}`);
-
-    ws.on('close', () => {
-        console.log(`❌ WebSocket disconnected: ${username}`);
-    });
 });
 
 server.on('upgrade', (request, socket, head) => {
@@ -423,11 +389,10 @@ server.on('upgrade', (request, socket, head) => {
             wss.emit('connection', ws, request, username);
         });
     } catch (error) {
-        console.error('Upgrade error:', error);
         socket.destroy();
     }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
