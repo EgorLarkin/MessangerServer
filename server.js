@@ -76,6 +76,7 @@ function generateMessageId() {
 function getUserData(username) {
     const user = usersDB[username];
     if (!user) return null;
+
     return {
         id: user.id,
         username: user.username,
@@ -118,12 +119,12 @@ function updateConversation(username, chatWith, lastMessage, timestamp, messageT
 }
 
 function sanitizeMessage(message) {
-    const { mediaData, ...rest } = message;
-    return rest;
+    return message;
 }
 
 function sendMessageToParticipants(message, username, to) {
     const payload = JSON.stringify(sanitizeMessage(message));
+
     wss.clients.forEach(client => {
         if (
             client.readyState === WebSocket.OPEN &&
@@ -139,6 +140,7 @@ function requireAuth(req, res, next) {
     if (!token || !tokensDB[token]) {
         return res.status(401).json({ error: 'Неавторизован' });
     }
+
     req.username = tokensDB[token];
     req.token = token;
     next();
@@ -146,8 +148,14 @@ function requireAuth(req, res, next) {
 
 app.post('/auth/register', async (req, res) => {
     const { username, password, name } = req.body;
-    if (!username || !password || !name) return res.status(400).json({ error: 'Заполните все поля' });
-    if (usersDB[username]) return res.status(409).json({ error: 'Пользователь уже существует' });
+
+    if (!username || !password || !name) {
+        return res.status(400).json({ error: 'Заполните все поля' });
+    }
+
+    if (usersDB[username]) {
+        return res.status(409).json({ error: 'Пользователь уже существует' });
+    }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = generateUserId();
@@ -172,13 +180,20 @@ app.post('/auth/register', async (req, res) => {
 
 app.post('/auth/login', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Заполните все поля' });
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Заполните все поля' });
+    }
 
     const user = usersDB[username];
-    if (!user) return res.status(401).json({ error: 'Неверный логин или пароль' });
+    if (!user) {
+        return res.status(401).json({ error: 'Неверный логин или пароль' });
+    }
 
     const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) return res.status(401).json({ error: 'Неверный логин или пароль' });
+    if (!isValid) {
+        return res.status(401).json({ error: 'Неверный логин или пароль' });
+    }
 
     const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
     tokensDB[token] = username;
@@ -221,9 +236,15 @@ app.put('/profile/avatar', requireAuth, (req, res) => {
 
 app.post('/notifications/register-token', requireAuth, (req, res) => {
     const { deviceToken } = req.body;
-    if (!deviceToken) return res.status(400).json({ error: 'deviceToken обязателен' });
 
-    if (!deviceTokensDB[req.username]) deviceTokensDB[req.username] = [];
+    if (!deviceToken) {
+        return res.status(400).json({ error: 'deviceToken обязателен' });
+    }
+
+    if (!deviceTokensDB[req.username]) {
+        deviceTokensDB[req.username] = [];
+    }
+
     if (!deviceTokensDB[req.username].includes(deviceToken)) {
         deviceTokensDB[req.username].push(deviceToken);
     }
@@ -258,24 +279,39 @@ app.get('/conversations', requireAuth, (req, res) => {
 
 app.post('/send', requireAuth, (req, res) => {
     const username = req.username;
-    const { to, text } = req.body;
+    const { to, text, mediaType, mediaData, duration, fileName, fileSize } = req.body;
 
-    if (!to) return res.status(400).json({ error: 'Получатель обязателен' });
-    if (!usersDB[to]) return res.status(404).json({ error: 'Пользователь не найден' });
-    if (!text || !text.trim()) return res.status(400).json({ error: 'Текст сообщения пустой' });
+    if (!to) {
+        return res.status(400).json({ error: 'Получатель обязателен' });
+    }
+
+    if (!usersDB[to]) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const type = mediaType || 'text';
+    const cleanText = typeof text === 'string' ? text.trim() : '';
+
+    if (type === 'text' && !cleanText) {
+        return res.status(400).json({ error: 'Текст сообщения пустой' });
+    }
+
+    if (type !== 'text' && !mediaData) {
+        return res.status(400).json({ error: 'Медиа-данные отсутствуют' });
+    }
 
     const message = {
         id: generateMessageId(),
         from: username,
         to,
-        text,
-        mediaType: 'text',
-        mediaData: null,
+        text: cleanText,
+        mediaType: type,
+        mediaData: mediaData || null,
         fileId: null,
         downloadUrl: null,
-        duration: null,
-        fileName: null,
-        fileSize: null,
+        duration: duration ? Number(duration) : null,
+        fileName: fileName || null,
+        fileSize: fileSize != null ? Number(fileSize) : null,
         timestamp: new Date().toISOString()
     };
 
@@ -283,8 +319,8 @@ app.post('/send', requireAuth, (req, res) => {
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
 
-    updateConversation(username, to, text, message.timestamp, 'text');
-    updateConversation(to, username, text, message.timestamp, 'text');
+    updateConversation(username, to, message.fileName || message.text || '', message.timestamp, type);
+    updateConversation(to, username, message.fileName || message.text || '', message.timestamp, type);
 
     sendMessageToParticipants(message, username, to);
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
@@ -294,11 +330,20 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
     const username = req.username;
     const { to, mediaType, text, duration } = req.body;
 
-    if (!to) return res.status(400).json({ error: 'Получатель обязателен' });
-    if (!usersDB[to]) return res.status(404).json({ error: 'Пользователь не найден' });
-    if (!req.file) return res.status(400).json({ error: 'Файл не найден' });
+    if (!to) {
+        return res.status(400).json({ error: 'Получатель обязателен' });
+    }
+
+    if (!usersDB[to]) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    if (!req.file) {
+        return res.status(400).json({ error: 'Файл не найден' });
+    }
 
     const fileId = crypto.randomUUID();
+
     filesDB[fileId] = {
         id: fileId,
         owner: username,
@@ -339,7 +384,10 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
 
 app.get('/files/:fileId', requireAuth, (req, res) => {
     const file = filesDB[req.params.fileId];
-    if (!file) return res.status(404).json({ error: 'Файл не найден' });
+
+    if (!file) {
+        return res.status(404).json({ error: 'Файл не найден' });
+    }
 
     if (req.username !== file.owner && req.username !== file.recipient) {
         return res.status(403).json({ error: 'Нет доступа' });
@@ -356,7 +404,9 @@ app.get('/history/:user1/:user2', requireAuth, (req, res) => {
     res.json({
         success: true,
         count: history.length,
-        messages: history.map(sanitizeMessage).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+        messages: history
+            .map(sanitizeMessage)
+            .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
     });
 });
 
@@ -365,6 +415,9 @@ const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws, request, username) => {
     ws.user = username;
+
+    ws.on('close', () => {});
+    ws.on('error', () => {});
 });
 
 server.on('upgrade', (request, socket, head) => {
@@ -377,6 +430,7 @@ server.on('upgrade', (request, socket, head) => {
         }
 
         const token = url.searchParams.get('token');
+
         if (!token || !tokensDB[token]) {
             socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
             socket.destroy();
