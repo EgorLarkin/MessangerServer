@@ -29,8 +29,8 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-app.use(bodyParser.json({ limit: '20mb', strict: false }));
-app.use(bodyParser.urlencoded({ limit: '20mb', extended: true }));
+app.use(bodyParser.json({ limit: '100mb', strict: false }));
+app.use(bodyParser.urlencoded({ limit: '100mb', extended: true }));
 
 app.use((req, res, next) => {
     res.setTimeout(300000);
@@ -144,6 +144,17 @@ function requireAuth(req, res, next) {
     req.username = tokensDB[token];
     req.token = token;
     next();
+}
+
+function normalizeBase64Attachment(att) {
+    if (!att || typeof att !== 'object') return null;
+    if (!att.mediaData || typeof att.mediaData !== 'string') return null;
+
+    return {
+        mediaData: att.mediaData,
+        fileName: att.fileName || null,
+        fileSize: att.fileSize != null ? Number(att.fileSize) : null
+    };
 }
 
 app.post('/auth/register', async (req, res) => {
@@ -279,7 +290,16 @@ app.get('/conversations', requireAuth, (req, res) => {
 
 app.post('/send', requireAuth, (req, res) => {
     const username = req.username;
-    const { to, text, mediaType, mediaData, duration, fileName, fileSize } = req.body;
+    const {
+        to,
+        text,
+        mediaType,
+        mediaData,
+        duration,
+        fileName,
+        fileSize,
+        attachments
+    } = req.body;
 
     if (!to) {
         return res.status(400).json({ error: 'Получатель обязателен' });
@@ -291,36 +311,92 @@ app.post('/send', requireAuth, (req, res) => {
 
     const type = mediaType || 'text';
     const cleanText = typeof text === 'string' ? text.trim() : '';
+    const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+    const hasSingleMedia = type !== 'text' && !!mediaData;
 
-    if (type === 'text' && !cleanText) {
+    if (type === 'text' && !cleanText && !hasAttachments) {
         return res.status(400).json({ error: 'Текст сообщения пустой' });
     }
 
-    if (type !== 'text' && !mediaData) {
+    if (type !== 'text' && !hasAttachments && !hasSingleMedia) {
         return res.status(400).json({ error: 'Медиа-данные отсутствуют' });
     }
 
-    const message = {
-        id: generateMessageId(),
-        from: username,
-        to,
-        text: cleanText,
-        mediaType: type,
-        mediaData: mediaData || null,
-        fileId: null,
-        downloadUrl: null,
-        duration: duration ? Number(duration) : null,
-        fileName: fileName || null,
-        fileSize: fileSize != null ? Number(fileSize) : null,
-        timestamp: new Date().toISOString()
-    };
+    const timestamp = new Date().toISOString();
+
+    let message;
+
+    if (hasAttachments) {
+        const normalizedAttachments = attachments
+            .map(normalizeBase64Attachment)
+            .filter(Boolean);
+
+        if (!normalizedAttachments.length) {
+            return res.status(400).json({ error: 'Нет валидных вложений' });
+        }
+
+        message = {
+            id: generateMessageId(),
+            from: username,
+            to,
+            text: cleanText,
+            mediaType: type,
+            mediaData: null,
+            attachments: normalizedAttachments,
+            fileId: null,
+            downloadUrl: null,
+            duration: duration != null ? Number(duration) : null,
+            fileName: null,
+            fileSize: null,
+            timestamp
+        };
+
+        const preview = mediaPreview(type, normalizedAttachments[0]?.fileName || '', cleanText);
+        updateConversation(username, to, preview, timestamp, type);
+        updateConversation(to, username, preview, timestamp, type);
+    } else if (hasSingleMedia) {
+        message = {
+            id: generateMessageId(),
+            from: username,
+            to,
+            text: cleanText,
+            mediaType: type,
+            mediaData: mediaData || null,
+            attachments: null,
+            fileId: null,
+            downloadUrl: null,
+            duration: duration != null ? Number(duration) : null,
+            fileName: fileName || null,
+            fileSize: fileSize != null ? Number(fileSize) : null,
+            timestamp
+        };
+
+        updateConversation(username, to, message.fileName || message.text || '', timestamp, type);
+        updateConversation(to, username, message.fileName || message.text || '', timestamp, type);
+    } else {
+        message = {
+            id: generateMessageId(),
+            from: username,
+            to,
+            text: cleanText,
+            mediaType: 'text',
+            mediaData: null,
+            attachments: null,
+            fileId: null,
+            downloadUrl: null,
+            duration: null,
+            fileName: null,
+            fileSize: null,
+            timestamp
+        };
+
+        updateConversation(username, to, message.text || '', timestamp, 'text');
+        updateConversation(to, username, message.text || '', timestamp, 'text');
+    }
 
     const chatKey = getChatKey(username, to);
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
-
-    updateConversation(username, to, message.fileName || message.text || '', message.timestamp, type);
-    updateConversation(to, username, message.fileName || message.text || '', message.timestamp, type);
 
     sendMessageToParticipants(message, username, to);
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
@@ -363,6 +439,7 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
         text: text || '',
         mediaType: mediaType || 'file',
         mediaData: null,
+        attachments: null,
         fileId,
         downloadUrl: `${BASE_URL}/files/${fileId}`,
         duration: duration ? Number(duration) : null,
