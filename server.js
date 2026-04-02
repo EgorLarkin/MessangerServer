@@ -220,6 +220,19 @@ app.get('/auth/verify', requireAuth, (req, res) => {
     res.json({ valid: true, user: getUserData(req.username) });
 });
 
+app.get('/users', requireAuth, (req, res) => {
+    const users = Object.values(usersDB)
+        .filter(u => u.username !== req.username)
+        .map(u => ({
+            id: u.id,
+            username: u.username,
+            name: u.name,
+            avatar: u.avatar || null
+        }));
+
+    res.json({ success: true, users });
+});
+
 app.get('/users/search', requireAuth, (req, res) => {
     const query = (req.query.q || '').toLowerCase();
 
@@ -237,6 +250,53 @@ app.get('/users/search', requireAuth, (req, res) => {
         }));
 
     res.json({ users: filteredUsers });
+});
+
+app.put('/profile', requireAuth, (req, res) => {
+    const { name } = req.body;
+
+    if (!name || !String(name).trim()) {
+        return res.status(400).json({ error: 'Имя обязательно' });
+    }
+
+    usersDB[req.username].name = String(name).trim();
+
+    res.json({
+        success: true,
+        user: getUserData(req.username)
+    });
+});
+
+app.delete('/profile', requireAuth, (req, res) => {
+    const username = req.username;
+
+    delete usersDB[username];
+    delete deviceTokensDB[username];
+    delete conversationsDB[username];
+
+    Object.keys(tokensDB).forEach(token => {
+        if (tokensDB[token] === username) {
+            delete tokensDB[token];
+        }
+    });
+
+    Object.keys(messagesDB).forEach(chatKey => {
+        messagesDB[chatKey] = (messagesDB[chatKey] || []).filter(
+            msg => msg.from !== username && msg.to !== username
+        );
+
+        if (messagesDB[chatKey].length === 0) {
+            delete messagesDB[chatKey];
+        }
+    });
+
+    Object.keys(conversationsDB).forEach(user => {
+        conversationsDB[user] = (conversationsDB[user] || []).filter(
+            conv => conv.chatWith !== username
+        );
+    });
+
+    res.json({ success: true });
 });
 
 app.put('/profile/avatar', requireAuth, (req, res) => {
@@ -323,7 +383,6 @@ app.post('/send', requireAuth, (req, res) => {
     }
 
     const timestamp = new Date().toISOString();
-
     let message;
 
     if (hasAttachments) {
