@@ -518,6 +518,86 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
+app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => {
+    const username = req.username;
+    const { to, mediaType, text, durations } = req.body;
+
+    if (!to) {
+        return res.status(400).json({ error: 'Получатель обязателен' });
+    }
+
+    if (!usersDB[to]) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const files = req.files || [];
+    if (!files.length) {
+        return res.status(400).json({ error: 'Файлы не найдены' });
+    }
+
+    let parsedDurations = [];
+    if (durations) {
+        try {
+            parsedDurations = JSON.parse(durations).map(Number);
+        } catch (e) {
+            parsedDurations = [];
+        }
+    }
+
+    const timestamp = new Date().toISOString();
+    const type = mediaType || 'video';
+
+    const attachments = files.map((file, index) => {
+        const fileId = crypto.randomUUID();
+
+        filesDB[fileId] = {
+            id: fileId,
+            owner: username,
+            recipient: to,
+            originalName: file.originalname,
+            storedName: file.filename,
+            mimetype: file.mimetype,
+            size: file.size,
+            path: file.path,
+            createdAt: timestamp
+        };
+
+        return {
+            mediaData: `${BASE_URL}/files/${fileId}`,
+            fileName: file.originalname,
+            fileSize: file.size,
+            duration: parsedDurations[index] ?? null
+        };
+    });
+
+    const message = {
+        id: generateMessageId(),
+        from: username,
+        to,
+        text: text || '',
+        mediaType: type,
+        mediaData: null,
+        attachments,
+        fileId: null,
+        downloadUrl: null,
+        duration: null,
+        fileName: null,
+        fileSize: null,
+        timestamp
+    };
+
+    const chatKey = getChatKey(username, to);
+    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
+    messagesDB[chatKey].push(message);
+
+    const preview = mediaPreview(type, attachments[0]?.fileName || '', text || '');
+    updateConversation(username, to, preview, timestamp, type);
+    updateConversation(to, username, preview, timestamp, type);
+
+    sendMessageToParticipants(message, username, to);
+    res.status(201).json({ success: true, message: sanitizeMessage(message) });
+});
+
 app.get('/files/:fileId', requireAuth, (req, res) => {
     const file = filesDB[req.params.fileId];
 
