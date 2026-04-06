@@ -85,10 +85,10 @@ function getUserData(username) {
     };
 }
 
-function mediaPreview(type, fileName, text) {
+function mediaPreview(type, fileName, text, attachmentsCount = 0) {
     if (type === 'text') return text || '';
-    if (type === 'image') return '📷 Фото';
-    if (type === 'video') return '🎬 Видео';
+    if (type === 'image') return attachmentsCount > 1 ? `📷 Фото (${attachmentsCount})` : '📷 Фото';
+    if (type === 'video') return attachmentsCount > 1 ? `🎬 Видео (${attachmentsCount})` : '🎬 Видео';
     if (type === 'file') return fileName || '📎 Файл';
     if (type === 'voice') return '🎤 Голосовое';
     if (type === 'video_note') return '⭕ Кружочек';
@@ -153,7 +153,9 @@ function normalizeBase64Attachment(att) {
     return {
         mediaData: att.mediaData,
         fileName: att.fileName || null,
-        fileSize: att.fileSize != null ? Number(att.fileSize) : null
+        fileSize: att.fileSize != null ? Number(att.fileSize) : null,
+        downloadUrl: att.downloadUrl || null,
+        duration: att.duration != null ? Number(att.duration) : null
     };
 }
 
@@ -410,7 +412,7 @@ app.post('/send', requireAuth, (req, res) => {
             timestamp
         };
 
-        const preview = mediaPreview(type, normalizedAttachments[0]?.fileName || '', cleanText);
+        const preview = mediaPreview(type, normalizedAttachments[0]?.fileName || '', cleanText, normalizedAttachments.length);
         updateConversation(username, to, preview, timestamp, type);
         updateConversation(to, username, preview, timestamp, type);
     } else if (hasSingleMedia) {
@@ -478,6 +480,7 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
     }
 
     const fileId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
 
     filesDB[fileId] = {
         id: fileId,
@@ -488,7 +491,7 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
         mimetype: req.file.mimetype,
         size: req.file.size,
         path: req.file.path,
-        createdAt: new Date().toISOString()
+        createdAt: timestamp
     };
 
     const message = {
@@ -504,7 +507,7 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
         duration: duration ? Number(duration) : null,
         fileName: req.file.originalname,
         fileSize: req.file.size,
-        timestamp: new Date().toISOString()
+        timestamp
     };
 
     const chatKey = getChatKey(username, to);
@@ -518,9 +521,13 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
-app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => {
+app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res) => {
     const username = req.username;
     const { to, mediaType, text, durations } = req.body;
+
+    console.log('➡️ /send-media-group called');
+    console.log('body:', req.body);
+    console.log('files count:', req.files ? req.files.length : 0);
 
     if (!to) {
         return res.status(400).json({ error: 'Получатель обязателен' });
@@ -535,6 +542,8 @@ app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => 
         return res.status(400).json({ error: 'Файлы не найдены' });
     }
 
+    const type = mediaType || 'video';
+
     let parsedDurations = [];
     if (durations) {
         try {
@@ -545,10 +554,10 @@ app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => 
     }
 
     const timestamp = new Date().toISOString();
-    const type = mediaType || 'video';
 
     const attachments = files.map((file, index) => {
         const fileId = crypto.randomUUID();
+        const downloadUrl = `${BASE_URL}/files/${fileId}`;
 
         filesDB[fileId] = {
             id: fileId,
@@ -563,7 +572,8 @@ app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => 
         };
 
         return {
-            mediaData: `${BASE_URL}/files/${fileId}`,
+            mediaData: downloadUrl,
+            downloadUrl: downloadUrl,
             fileName: file.originalname,
             fileSize: file.size,
             duration: parsedDurations[index] ?? null
@@ -577,7 +587,7 @@ app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => 
         text: text || '',
         mediaType: type,
         mediaData: null,
-        attachments,
+        attachments: attachments,
         fileId: null,
         downloadUrl: null,
         duration: null,
@@ -590,12 +600,16 @@ app.post('/send-media-group', requireAuth, upload.array('files'), (req, res) => 
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
 
-    const preview = mediaPreview(type, attachments[0]?.fileName || '', text || '');
+    const preview = mediaPreview(type, attachments[0]?.fileName || '', text || '', attachments.length);
     updateConversation(username, to, preview, timestamp, type);
     updateConversation(to, username, preview, timestamp, type);
 
     sendMessageToParticipants(message, username, to);
-    res.status(201).json({ success: true, message: sanitizeMessage(message) });
+
+    return res.status(201).json({
+        success: true,
+        message: sanitizeMessage(message)
+    });
 });
 
 app.get('/files/:fileId', requireAuth, (req, res) => {
