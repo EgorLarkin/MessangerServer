@@ -38,9 +38,7 @@ app.use((req, res, next) => {
 });
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, UPLOADS_DIR);
-    },
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
         const ext = path.extname(file.originalname) || '';
         cb(null, crypto.randomUUID() + ext);
@@ -50,7 +48,8 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage,
     limits: {
-        fileSize: 1024 * 1024 * 1024
+        fileSize: 1024 * 1024 * 1024,
+        files: 20
     }
 });
 
@@ -85,21 +84,21 @@ function getUserData(username) {
     };
 }
 
-function mediaPreview(type, fileName, text, attachmentsCount = 0) {
+function mediaPreview(type, fileName, text, count = 0) {
     if (type === 'text') return text || '';
-    if (type === 'image') return attachmentsCount > 1 ? `📷 Фото (${attachmentsCount})` : '📷 Фото';
-    if (type === 'video') return attachmentsCount > 1 ? `🎬 Видео (${attachmentsCount})` : '🎬 Видео';
+    if (type === 'image') return count > 1 ? `📷 Фото (${count})` : '📷 Фото';
+    if (type === 'video') return count > 1 ? `🎬 Видео (${count})` : '🎬 Видео';
     if (type === 'file') return fileName || '📎 Файл';
     if (type === 'voice') return '🎤 Голосовое';
     if (type === 'video_note') return '⭕ Кружочек';
     return fileName || 'Медиа';
 }
 
-function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text') {
+function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text', count = 0) {
     if (!conversationsDB[username]) conversationsDB[username] = [];
 
     const existing = conversationsDB[username].find(c => c.chatWith === chatWith);
-    const preview = mediaPreview(messageType, lastMessage, lastMessage);
+    const preview = mediaPreview(messageType, lastMessage, lastMessage, count);
 
     if (existing) {
         existing.lastMessage = preview;
@@ -413,8 +412,8 @@ app.post('/send', requireAuth, (req, res) => {
         };
 
         const preview = mediaPreview(type, normalizedAttachments[0]?.fileName || '', cleanText, normalizedAttachments.length);
-        updateConversation(username, to, preview, timestamp, type);
-        updateConversation(to, username, preview, timestamp, type);
+        updateConversation(username, to, preview, timestamp, type, normalizedAttachments.length);
+        updateConversation(to, username, preview, timestamp, type, normalizedAttachments.length);
     } else if (hasSingleMedia) {
         message = {
             id: generateMessageId(),
@@ -432,8 +431,8 @@ app.post('/send', requireAuth, (req, res) => {
             timestamp
         };
 
-        updateConversation(username, to, message.fileName || message.text || '', timestamp, type);
-        updateConversation(to, username, message.fileName || message.text || '', timestamp, type);
+        updateConversation(username, to, message.fileName || message.text || '', timestamp, type, 1);
+        updateConversation(to, username, message.fileName || message.text || '', timestamp, type, 1);
     } else {
         message = {
             id: generateMessageId(),
@@ -451,8 +450,8 @@ app.post('/send', requireAuth, (req, res) => {
             timestamp
         };
 
-        updateConversation(username, to, message.text || '', timestamp, 'text');
-        updateConversation(to, username, message.text || '', timestamp, 'text');
+        updateConversation(username, to, message.text || '', timestamp, 'text', 0);
+        updateConversation(to, username, message.text || '', timestamp, 'text', 0);
     }
 
     const chatKey = getChatKey(username, to);
@@ -479,8 +478,8 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
         return res.status(400).json({ error: 'Файл не найден' });
     }
 
-    const fileId = crypto.randomUUID();
     const timestamp = new Date().toISOString();
+    const fileId = crypto.randomUUID();
 
     filesDB[fileId] = {
         id: fileId,
@@ -514,8 +513,8 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
     if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
     messagesDB[chatKey].push(message);
 
-    updateConversation(username, to, req.file.originalname, message.timestamp, message.mediaType);
-    updateConversation(to, username, req.file.originalname, message.timestamp, message.mediaType);
+    updateConversation(username, to, req.file.originalname, message.timestamp, message.mediaType, 1);
+    updateConversation(to, username, req.file.originalname, message.timestamp, message.mediaType, 1);
 
     sendMessageToParticipants(message, username, to);
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
@@ -524,10 +523,6 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
 app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res) => {
     const username = req.username;
     const { to, mediaType, text, durations } = req.body;
-
-    console.log('➡️ /send-media-group called');
-    console.log('body:', req.body);
-    console.log('files count:', req.files ? req.files.length : 0);
 
     if (!to) {
         return res.status(400).json({ error: 'Получатель обязателен' });
@@ -587,7 +582,7 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
         text: text || '',
         mediaType: type,
         mediaData: null,
-        attachments: attachments,
+        attachments,
         fileId: null,
         downloadUrl: null,
         duration: null,
@@ -601,15 +596,11 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
     messagesDB[chatKey].push(message);
 
     const preview = mediaPreview(type, attachments[0]?.fileName || '', text || '', attachments.length);
-    updateConversation(username, to, preview, timestamp, type);
-    updateConversation(to, username, preview, timestamp, type);
+    updateConversation(username, to, preview, timestamp, type, attachments.length);
+    updateConversation(to, username, preview, timestamp, type, attachments.length);
 
     sendMessageToParticipants(message, username, to);
-
-    return res.status(201).json({
-        success: true,
-        message: sanitizeMessage(message)
-    });
+    res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
 app.get('/files/:fileId', requireAuth, (req, res) => {
@@ -645,7 +636,6 @@ const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws, request, username) => {
     ws.user = username;
-
     ws.on('close', () => {});
     ws.on('error', () => {});
 });
