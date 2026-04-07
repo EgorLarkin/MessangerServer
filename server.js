@@ -84,8 +84,16 @@ function getUserData(username) {
     };
 }
 
+function attachmentTypeFromMime(mimetype = '') {
+    if (mimetype.startsWith('image/')) return 'image';
+    if (mimetype.startsWith('video/')) return 'video';
+    if (mimetype.startsWith('audio/')) return 'voice';
+    return 'file';
+}
+
 function mediaPreview(type, fileName, text, count = 0) {
     if (type === 'text') return text || '';
+    if (type === 'mixed') return count > 1 ? `📎 Вложения (${count})` : '📎 Вложение';
     if (type === 'image') return count > 1 ? `📷 Фото (${count})` : '📷 Фото';
     if (type === 'video') return count > 1 ? `🎬 Видео (${count})` : '🎬 Видео';
     if (type === 'file') return fileName || '📎 Файл';
@@ -568,7 +576,7 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
 
         return {
             mediaData: downloadUrl,
-            downloadUrl: downloadUrl,
+            downloadUrl,
             fileName: file.originalname,
             fileSize: file.size,
             duration: parsedDurations[index] ?? null
@@ -598,6 +606,98 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
     const preview = mediaPreview(type, attachments[0]?.fileName || '', text || '', attachments.length);
     updateConversation(username, to, preview, timestamp, type, attachments.length);
     updateConversation(to, username, preview, timestamp, type, attachments.length);
+
+    sendMessageToParticipants(message, username, to);
+    res.status(201).json({ success: true, message: sanitizeMessage(message) });
+});
+
+app.post('/send-media-mixed-group', requireAuth, upload.array('files', 20), (req, res) => {
+    const username = req.username;
+    const { to, text, durations, itemTypes } = req.body;
+
+    if (!to) {
+        return res.status(400).json({ error: 'Получатель обязателен' });
+    }
+
+    if (!usersDB[to]) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const files = req.files || [];
+    if (!files.length) {
+        return res.status(400).json({ error: 'Файлы не найдены' });
+    }
+
+    let parsedDurations = [];
+    if (durations) {
+        try {
+            parsedDurations = JSON.parse(durations).map(value => value == null ? null : Number(value));
+        } catch (e) {
+            parsedDurations = [];
+        }
+    }
+
+    let parsedItemTypes = [];
+    if (itemTypes) {
+        try {
+            parsedItemTypes = JSON.parse(itemTypes);
+        } catch (e) {
+            parsedItemTypes = [];
+        }
+    }
+
+    const timestamp = new Date().toISOString();
+
+    const attachments = files.map((file, index) => {
+        const fileId = crypto.randomUUID();
+        const downloadUrl = `${BASE_URL}/files/${fileId}`;
+        const inferredType = parsedItemTypes[index] || attachmentTypeFromMime(file.mimetype);
+
+        filesDB[fileId] = {
+            id: fileId,
+            owner: username,
+            recipient: to,
+            originalName: file.originalname,
+            storedName: file.filename,
+            mimetype: file.mimetype,
+            size: file.size,
+            path: file.path,
+            createdAt: timestamp
+        };
+
+        return {
+            mediaData: downloadUrl,
+            downloadUrl,
+            fileName: file.originalname,
+            fileSize: file.size,
+            duration: parsedDurations[index] ?? null,
+            type: inferredType
+        };
+    });
+
+    const message = {
+        id: generateMessageId(),
+        from: username,
+        to,
+        text: text || '',
+        mediaType: 'mixed',
+        mediaData: null,
+        attachments,
+        fileId: null,
+        downloadUrl: null,
+        duration: null,
+        fileName: null,
+        fileSize: null,
+        timestamp
+    };
+
+    const chatKey = getChatKey(username, to);
+    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
+    messagesDB[chatKey].push(message);
+
+    const preview = mediaPreview('mixed', attachments[0]?.fileName || '', text || '', attachments.length);
+    updateConversation(username, to, preview, timestamp, 'mixed', attachments.length);
+    updateConversation(to, username, preview, timestamp, 'mixed', attachments.length);
 
     sendMessageToParticipants(message, username, to);
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
