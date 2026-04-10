@@ -102,31 +102,65 @@ function mediaPreview(type, fileName, text, count = 0) {
     return fileName || 'Медиа';
 }
 
-function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text', count = 0) {
+function ensureConversation(username, chatWith) {
     if (!conversationsDB[username]) conversationsDB[username] = [];
+    let existing = conversationsDB[username].find(c => c.chatWith === chatWith);
+    if (!existing) {
+        existing = {
+            chatWith,
+            lastMessage: '',
+            timestamp: new Date().toISOString(),
+            unreadCount: 0,
+            lastMessageType: 'text'
+        };
+        conversationsDB[username].push(existing);
+    }
+    return existing;
+}
 
-    const existing = conversationsDB[username].find(c => c.chatWith === chatWith);
+function updateConversation(username, chatWith, lastMessage, timestamp, messageType = 'text', count = 0) {
+    const existing = ensureConversation(username, chatWith);
     const preview = mediaPreview(messageType, lastMessage, lastMessage, count);
 
-    if (existing) {
-        existing.lastMessage = preview;
-        existing.timestamp = timestamp;
-        existing.lastMessageType = messageType;
-    } else {
-        conversationsDB[username].push({
-            chatWith,
-            lastMessage: preview,
-            timestamp,
-            unreadCount: 0,
-            lastMessageType: messageType
-        });
-    }
+    existing.lastMessage = preview;
+    existing.timestamp = timestamp;
+    existing.lastMessageType = messageType;
 
     conversationsDB[username].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
+function removeConversationIfEmpty(username, chatWith) {
+    const chatKey = getChatKey(username, chatWith);
+    const visible = getVisibleMessagesForUser(chatKey, username);
+    if (visible.length > 0) return;
+
+    if (!conversationsDB[username]) return;
+    conversationsDB[username] = conversationsDB[username].filter(c => c.chatWith !== chatWith);
+}
+
+function recomputeConversationForUser(username, chatWith) {
+    const chatKey = getChatKey(username, chatWith);
+    const visible = getVisibleMessagesForUser(chatKey, username).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    if (!visible.length) {
+        removeConversationIfEmpty(username, chatWith);
+        return;
+    }
+
+    const last = visible[visible.length - 1];
+    const count = Array.isArray(last.attachments) ? last.attachments.length : (last.mediaType === 'text' ? 0 : 1);
+    const previewSource = last.fileName || last.text || last.attachments?.[0]?.fileName || '';
+    updateConversation(username, chatWith, previewSource, last.timestamp, last.mediaType || 'text', count);
+}
+
 function sanitizeMessage(message) {
-    return message;
+    return {
+        ...message,
+        deletedFor: Array.isArray(message.deletedFor) ? message.deletedFor : [],
+        deletedForEveryone: !!message.deletedForEveryone,
+        edited: !!message.edited,
+        editedAt: message.editedAt || null
+    };
 }
 
 function sendMessageToParticipants(message, username, to) {
@@ -136,6 +170,18 @@ function sendMessageToParticipants(message, username, to) {
         if (
             client.readyState === WebSocket.OPEN &&
             (client.user === username || client.user === to)
+        ) {
+            client.send(payload);
+        }
+    });
+}
+
+function sendEventToUsers(users, event) {
+    const payload = JSON.stringify(event);
+    wss.clients.forEach(client => {
+        if (
+            client.readyState === WebSocket.OPEN &&
+            users.includes(client.user)
         ) {
             client.send(payload);
         }
@@ -162,8 +208,113 @@ function normalizeBase64Attachment(att) {
         fileName: att.fileName || null,
         fileSize: att.fileSize != null ? Number(att.fileSize) : null,
         downloadUrl: att.downloadUrl || null,
-        duration: att.duration != null ? Number(att.duration) : null
+        duration: att.duration != null ? Number(att.duration) : null,
+        type: att.type || null
     };
+}
+
+function createBaseMessage({
+    from,
+    to,
+    text = '',
+    mediaType = 'text',
+    mediaData = null,
+    attachments = null,
+    fileId = null,
+    downloadUrl = null,
+    duration = null,
+    fileName = null,
+    fileSize = null,
+    timestamp = new Date().toISOString()
+}) {
+    return {
+        id: generateMessageId(),
+        from,
+        to,
+        text,
+        mediaType,
+        mediaData,
+        attachments,
+        fileId,
+        downloadUrl,
+        duration,
+        fileName,
+        fileSize,
+        timestamp,
+        deletedFor: [],
+        deletedForEveryone: false,
+        edited: false,
+        editedAt: null
+    };
+}
+
+function findMessageById(messageId) {
+    for (const [chatKey, list] of Object.entries(messagesDB)) {
+        const index = list.findIndex(m => m.id === messageId);
+        if (index !== -1) {
+            return {
+                chatKey,
+                index,
+                message: list[index]
+            };
+        }
+    }
+    return null;
+}
+
+function isMessageVisibleForUser(message, username) {
+    if (!message) return false;
+    if (message.deletedForEveryone) return false;
+    if (Array.isArray(message.deletedFor) && message.deletedFor.includes(username)) return false;
+    return true;
+}
+
+function getVisibleMessagesForUser(chatKey, username) {
+    return (messagesDB[chatKey] || []).filter(msg => isMessageVisibleForUser(msg, username));
+}
+
+function hydrateConversationListForUser(username) {
+    const convs = conversationsDB[username] || [];
+    return convs.map(conv => {
+        const user = usersDB[conv.chatWith];
+        if (!user) return null;
+
+        return {
+            chatWith: conv.chatWith,
+            lastMessage: conv.lastMessage,
+            timestamp: conv.timestamp,
+            unreadCount: conv.unreadCount || 0,
+            lastMessageType: conv.lastMessageType || 'text',
+            user: {
+                id: user.id,
+                username: user.username,
+                name: user.name,
+                avatar: user.avatar || null
+            }
+        };
+    }).filter(Boolean);
+}
+
+function recalcBothConversations(userA, userB) {
+    recomputeConversationForUser(userA, userB);
+    recomputeConversationForUser(userB, userA);
+}
+
+function createAndStoreMessage(message) {
+    const chatKey = getChatKey(message.from, message.to);
+    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
+    messagesDB[chatKey].push(message);
+
+    const count = Array.isArray(message.attachments) ? message.attachments.length : (message.mediaType === 'text' ? 0 : 1);
+    const previewSource = message.fileName || message.text || message.attachments?.[0]?.fileName || '';
+    updateConversation(message.from, message.to, previewSource, message.timestamp, message.mediaType, count);
+    updateConversation(message.to, message.from, previewSource, message.timestamp, message.mediaType, count);
+
+    return message;
+}
+
+function filterMessagesForUser(history, username) {
+    return history.filter(msg => isMessageVisibleForUser(msg, username));
 }
 
 app.post('/auth/register', async (req, res) => {
@@ -333,27 +484,7 @@ app.post('/notifications/register-token', requireAuth, (req, res) => {
 });
 
 app.get('/conversations', requireAuth, (req, res) => {
-    const conversations = conversationsDB[req.username] || [];
-
-    const enriched = conversations.map(conv => {
-        const user = usersDB[conv.chatWith];
-        if (!user) return null;
-
-        return {
-            chatWith: conv.chatWith,
-            lastMessage: conv.lastMessage,
-            timestamp: conv.timestamp,
-            unreadCount: conv.unreadCount || 0,
-            lastMessageType: conv.lastMessageType || 'text',
-            user: {
-                id: user.id,
-                username: user.username,
-                name: user.name,
-                avatar: user.avatar || null
-            }
-        };
-    }).filter(Boolean);
-
+    const enriched = hydrateConversationListForUser(req.username);
     res.json({ success: true, conversations: enriched });
 });
 
@@ -403,70 +534,44 @@ app.post('/send', requireAuth, (req, res) => {
             return res.status(400).json({ error: 'Нет валидных вложений' });
         }
 
-        message = {
-            id: generateMessageId(),
+        message = createBaseMessage({
             from: username,
             to,
             text: cleanText,
             mediaType: type,
             mediaData: null,
             attachments: normalizedAttachments,
-            fileId: null,
-            downloadUrl: null,
             duration: duration != null ? Number(duration) : null,
             fileName: null,
             fileSize: null,
             timestamp
-        };
-
-        const preview = mediaPreview(type, normalizedAttachments[0]?.fileName || '', cleanText, normalizedAttachments.length);
-        updateConversation(username, to, preview, timestamp, type, normalizedAttachments.length);
-        updateConversation(to, username, preview, timestamp, type, normalizedAttachments.length);
+        });
     } else if (hasSingleMedia) {
-        message = {
-            id: generateMessageId(),
+        message = createBaseMessage({
             from: username,
             to,
             text: cleanText,
             mediaType: type,
             mediaData: mediaData || null,
             attachments: null,
-            fileId: null,
-            downloadUrl: null,
             duration: duration != null ? Number(duration) : null,
             fileName: fileName || null,
             fileSize: fileSize != null ? Number(fileSize) : null,
             timestamp
-        };
-
-        updateConversation(username, to, message.fileName || message.text || '', timestamp, type, 1);
-        updateConversation(to, username, message.fileName || message.text || '', timestamp, type, 1);
+        });
     } else {
-        message = {
-            id: generateMessageId(),
+        message = createBaseMessage({
             from: username,
             to,
             text: cleanText,
             mediaType: 'text',
-            mediaData: null,
-            attachments: null,
-            fileId: null,
-            downloadUrl: null,
-            duration: null,
-            fileName: null,
-            fileSize: null,
             timestamp
-        };
-
-        updateConversation(username, to, message.text || '', timestamp, 'text', 0);
-        updateConversation(to, username, message.text || '', timestamp, 'text', 0);
+        });
     }
 
-    const chatKey = getChatKey(username, to);
-    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
-    messagesDB[chatKey].push(message);
-
+    createAndStoreMessage(message);
     sendMessageToParticipants(message, username, to);
+
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
@@ -501,8 +606,7 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
         createdAt: timestamp
     };
 
-    const message = {
-        id: generateMessageId(),
+    const message = createBaseMessage({
         from: username,
         to,
         text: text || '',
@@ -515,16 +619,11 @@ app.post('/send-media', requireAuth, upload.single('file'), (req, res) => {
         fileName: req.file.originalname,
         fileSize: req.file.size,
         timestamp
-    };
+    });
 
-    const chatKey = getChatKey(username, to);
-    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
-    messagesDB[chatKey].push(message);
-
-    updateConversation(username, to, req.file.originalname, message.timestamp, message.mediaType, 1);
-    updateConversation(to, username, req.file.originalname, message.timestamp, message.mediaType, 1);
-
+    createAndStoreMessage(message);
     sendMessageToParticipants(message, username, to);
+
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
@@ -583,8 +682,7 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
         };
     });
 
-    const message = {
-        id: generateMessageId(),
+    const message = createBaseMessage({
         from: username,
         to,
         text: text || '',
@@ -597,17 +695,11 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
         fileName: null,
         fileSize: null,
         timestamp
-    };
+    });
 
-    const chatKey = getChatKey(username, to);
-    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
-    messagesDB[chatKey].push(message);
-
-    const preview = mediaPreview(type, attachments[0]?.fileName || '', text || '', attachments.length);
-    updateConversation(username, to, preview, timestamp, type, attachments.length);
-    updateConversation(to, username, preview, timestamp, type, attachments.length);
-
+    createAndStoreMessage(message);
     sendMessageToParticipants(message, username, to);
+
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
 });
 
@@ -675,8 +767,7 @@ app.post('/send-media-mixed-group', requireAuth, upload.array('files', 20), (req
         };
     });
 
-    const message = {
-        id: generateMessageId(),
+    const message = createBaseMessage({
         from: username,
         to,
         text: text || '',
@@ -689,18 +780,265 @@ app.post('/send-media-mixed-group', requireAuth, upload.array('files', 20), (req
         fileName: null,
         fileSize: null,
         timestamp
-    };
+    });
 
-    const chatKey = getChatKey(username, to);
-    if (!messagesDB[chatKey]) messagesDB[chatKey] = [];
-    messagesDB[chatKey].push(message);
-
-    const preview = mediaPreview('mixed', attachments[0]?.fileName || '', text || '', attachments.length);
-    updateConversation(username, to, preview, timestamp, 'mixed', attachments.length);
-    updateConversation(to, username, preview, timestamp, 'mixed', attachments.length);
-
+    createAndStoreMessage(message);
     sendMessageToParticipants(message, username, to);
+
     res.status(201).json({ success: true, message: sanitizeMessage(message) });
+});
+
+app.post('/messages/forward', requireAuth, (req, res) => {
+    const username = req.username;
+    const { messageIds, to } = req.body;
+
+    if (!to) {
+        return res.status(400).json({ error: 'Получатель обязателен' });
+    }
+
+    if (!usersDB[to]) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    if (!Array.isArray(messageIds) || !messageIds.length) {
+        return res.status(400).json({ error: 'Нужен список messageIds' });
+    }
+
+    const forwarded = [];
+
+    for (const messageId of messageIds) {
+        const found = findMessageById(messageId);
+        if (!found) continue;
+
+        const source = found.message;
+        if (!isMessageVisibleForUser(source, username)) continue;
+
+        const cloned = createBaseMessage({
+            from: username,
+            to,
+            text: source.text || '',
+            mediaType: source.mediaType || 'text',
+            mediaData: source.mediaData || null,
+            attachments: source.attachments ? JSON.parse(JSON.stringify(source.attachments)) : null,
+            fileId: source.fileId || null,
+            downloadUrl: source.downloadUrl || null,
+            duration: source.duration ?? null,
+            fileName: source.fileName || null,
+            fileSize: source.fileSize ?? null,
+            timestamp: new Date().toISOString()
+        });
+
+        createAndStoreMessage(cloned);
+        sendMessageToParticipants(cloned, username, to);
+        forwarded.push(sanitizeMessage(cloned));
+    }
+
+    res.status(201).json({
+        success: true,
+        count: forwarded.length,
+        messages: forwarded
+    });
+});
+
+app.put('/messages/:messageId', requireAuth, (req, res) => {
+    const { messageId } = req.params;
+    const { text } = req.body;
+    const username = req.username;
+
+    if (!text || !String(text).trim()) {
+        return res.status(400).json({ error: 'Текст обязателен' });
+    }
+
+    const found = findMessageById(messageId);
+    if (!found) {
+        return res.status(404).json({ error: 'Сообщение не найдено' });
+    }
+
+    const message = found.message;
+
+    if (message.from !== username) {
+        return res.status(403).json({ error: 'Нет прав редактировать' });
+    }
+
+    if (message.deletedForEveryone) {
+        return res.status(400).json({ error: 'Сообщение уже удалено у всех' });
+    }
+
+    message.text = String(text).trim();
+    message.edited = true;
+    message.editedAt = new Date().toISOString();
+
+    recalcBothConversations(message.from, message.to);
+    sendEventToUsers([message.from, message.to], {
+        type: 'message_edited',
+        message: sanitizeMessage(message)
+    });
+
+    res.json({
+        success: true,
+        message: sanitizeMessage(message)
+    });
+});
+
+app.post('/messages/:messageId/delete-for-me', requireAuth, (req, res) => {
+    const { messageId } = req.params;
+    const username = req.username;
+
+    const found = findMessageById(messageId);
+    if (!found) {
+        return res.status(404).json({ error: 'Сообщение не найдено' });
+    }
+
+    const message = found.message;
+    if (message.from !== username && message.to !== username) {
+        return res.status(403).json({ error: 'Нет доступа' });
+    }
+
+    message.deletedFor = Array.isArray(message.deletedFor) ? message.deletedFor : [];
+    if (!message.deletedFor.includes(username)) {
+        message.deletedFor.push(username);
+    }
+
+    recomputeConversationForUser(username, message.from === username ? message.to : message.from);
+
+    res.json({ success: true, messageId });
+});
+
+app.post('/messages/:messageId/delete-for-peer', requireAuth, (req, res) => {
+    const { messageId } = req.params;
+    const username = req.username;
+
+    const found = findMessageById(messageId);
+    if (!found) {
+        return res.status(404).json({ error: 'Сообщение не найдено' });
+    }
+
+    const message = found.message;
+
+    if (message.from !== username) {
+        return res.status(403).json({ error: 'Удалить у собеседника может только отправитель' });
+    }
+
+    if (message.deletedForEveryone) {
+        return res.status(400).json({ error: 'Сообщение уже удалено у всех' });
+    }
+
+    const peer = message.to;
+    message.deletedFor = Array.isArray(message.deletedFor) ? message.deletedFor : [];
+
+    if (!message.deletedFor.includes(peer)) {
+        message.deletedFor.push(peer);
+    }
+
+    recomputeConversationForUser(peer, username);
+
+    sendEventToUsers([peer], {
+        type: 'message_deleted_for_you',
+        messageId: message.id,
+        by: username
+    });
+
+    res.json({ success: true, messageId });
+});
+
+app.post('/messages/:messageId/delete-for-all', requireAuth, (req, res) => {
+    const { messageId } = req.params;
+    const username = req.username;
+
+    const found = findMessageById(messageId);
+    if (!found) {
+        return res.status(404).json({ error: 'Сообщение не найдено' });
+    }
+
+    const message = found.message;
+
+    if (message.from !== username) {
+        return res.status(403).json({ error: 'Удалить у всех может только отправитель' });
+    }
+
+    if (message.deletedForEveryone) {
+        return res.status(400).json({ error: 'Сообщение уже удалено у всех' });
+    }
+
+    message.deletedForEveryone = true;
+
+    recalcBothConversations(message.from, message.to);
+
+    sendEventToUsers([message.from, message.to], {
+        type: 'message_deleted_for_all',
+        messageId: message.id,
+        by: username
+    });
+
+    res.json({ success: true, messageId });
+});
+
+app.post('/messages/bulk-delete', requireAuth, (req, res) => {
+    const username = req.username;
+    const { ids, mode } = req.body;
+
+    if (!Array.isArray(ids) || !ids.length) {
+        return res.status(400).json({ error: 'Нужен список ids' });
+    }
+
+    if (!['me', 'all'].includes(mode)) {
+        return res.status(400).json({ error: 'mode должен быть me или all' });
+    }
+
+    const updated = [];
+    const rejected = [];
+
+    for (const id of ids) {
+        const found = findMessageById(id);
+        if (!found) {
+            rejected.push({ id, reason: 'not_found' });
+            continue;
+        }
+
+        const message = found.message;
+
+        if (mode === 'me') {
+            if (message.from !== username && message.to !== username) {
+                rejected.push({ id, reason: 'forbidden' });
+                continue;
+            }
+
+            message.deletedFor = Array.isArray(message.deletedFor) ? message.deletedFor : [];
+            if (!message.deletedFor.includes(username)) {
+                message.deletedFor.push(username);
+            }
+
+            recomputeConversationForUser(username, message.from === username ? message.to : message.from);
+            updated.push(id);
+            continue;
+        }
+
+        if (mode === 'all') {
+            if (message.from !== username) {
+                rejected.push({ id, reason: 'not_sender' });
+                continue;
+            }
+
+            if (!message.deletedForEveryone) {
+                message.deletedForEveryone = true;
+                recalcBothConversations(message.from, message.to);
+                sendEventToUsers([message.from, message.to], {
+                    type: 'message_deleted_for_all',
+                    messageId: message.id,
+                    by: username
+                });
+            }
+
+            updated.push(id);
+        }
+    }
+
+    res.json({
+        success: true,
+        mode,
+        updated,
+        rejected
+    });
 });
 
 app.get('/files/:fileId', requireAuth, (req, res) => {
@@ -719,19 +1057,24 @@ app.get('/files/:fileId', requireAuth, (req, res) => {
 
 app.get('/history/:user1/:user2', requireAuth, (req, res) => {
     const { user1, user2 } = req.params;
+
+    if (req.username !== user1 && req.username !== user2) {
+        return res.status(403).json({ error: 'Нет доступа к истории' });
+    }
+
     const chatKey = getChatKey(user1, user2);
     const history = messagesDB[chatKey] || [];
+    const filtered = filterMessagesForUser(history, req.username);
 
     res.json({
         success: true,
-        count: history.length,
-        messages: history
+        count: filtered.length,
+        messages: filtered
             .map(sanitizeMessage)
             .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
     });
 });
 
-// ПРАВИЛЬНЫЙ /ping — ОТДЕЛЬНЫЙ МАРШРУТ
 app.get('/ping', (req, res) => {
     res.json({
         success: true,
