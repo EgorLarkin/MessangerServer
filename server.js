@@ -556,14 +556,6 @@ app.post('/send-media-group', requireAuth, upload.array('files', 20), (req, res)
         }
     }
 
-    app.get('/ping', (req, res) => {
-    res.json({
-        success: true,
-        message: 'pong',
-        time: new Date().toISOString()
-    });
-});
-
     const timestamp = new Date().toISOString();
 
     const attachments = files.map((file, index) => {
@@ -736,6 +728,15 @@ app.get('/history/:user1/:user2', requireAuth, (req, res) => {
         messages: history
             .map(sanitizeMessage)
             .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+    });
+});
+
+// ПРАВИЛЬНЫЙ /ping — ОТДЕЛЬНЫЙ МАРШРУТ
+app.get('/ping', (req, res) => {
+    res.json({
+        success: true,
+        message: 'pong',
+        time: new Date().toISOString()
     });
 });
 
